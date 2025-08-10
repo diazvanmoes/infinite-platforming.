@@ -1,0 +1,548 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Infinite Platformer with Leaderboard</title>
+  <style>
+    body { margin:0; background:#87ceeb; font-family:sans-serif; }
+    canvas { display:block; margin:0 auto; background:#87ceeb; }
+    #namePrompt {
+      position: fixed;
+      top: 40%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: white;
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 0 10px #0003;
+      text-align: center;
+      font-size: 16px;
+    }
+    #namePrompt input {
+      font-size: 16px;
+      padding: 6px 8px;
+      width: 180px;
+      margin-top: 8px;
+    }
+    #namePrompt button {
+      margin-top: 12px;
+      padding: 6px 12px;
+      font-size: 16px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+<canvas id="game" width="800" height="400"></canvas>
+
+<div id="namePrompt" style="display:none;">
+  <div>Enter your name:</div>
+  <input type="text" id="playerNameInput" maxlength="12" />
+  <br />
+  <button id="startBtn">Start Game</button>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const GRAVITY = 0.6;
+const JUMP_POWER = -11;
+const PLAYER_SPEED = 4;
+const PLATFORM_SPACING_BASE = 220;
+
+const EXTRA_LIFE_SPAWN_RATE = 0.05; // 5%
+const COIN_SPAWN_RATE = 0.55;       // 55%
+const ENEMY_SPAWN_RATE = 0.18;
+const MIN_PLATFORM_Y = 130;
+const MAX_PLATFORM_Y = canvas.height - 100;
+
+const MAX_LEADERBOARD_ENTRIES = 5;
+
+let playerName = null; // will be set from prompt
+
+let highestCoins = 0;
+
+let cameraX = 0;
+
+const player = {
+  x: 120,
+  y: 0,
+  width: 30,
+  height: 50,
+  vy: 0,
+  onGround: false,
+  lives: 1,
+  coins: 0,
+  frame: 0,
+  frameTick: 0,
+  facingRight: true,
+  deadTimer: 0
+};
+
+let platforms = [];
+let coins = [];
+let extraLives = [];
+let enemies = [];
+let particles = [];
+
+const keys = {};
+document.addEventListener('keydown', e => keys[e.code] = true);
+document.addEventListener('keyup', e => keys[e.code] = false);
+
+/* --- Leaderboard data in localStorage --- */
+
+function loadLeaderboard() {
+  const data = localStorage.getItem('leaderboard');
+  if (!data) return [];
+  try {
+    return JSON.parse(data);
+  } catch {
+    return [];
+  }
+}
+
+function saveLeaderboard(board) {
+  localStorage.setItem('leaderboard', JSON.stringify(board));
+}
+
+function updateLeaderboard(name, score) {
+  let board = loadLeaderboard();
+
+  // Check if name exists in leaderboard
+  let existingEntry = board.find(e => e.name === name);
+  if (existingEntry) {
+    if (score > existingEntry.score) {
+      existingEntry.score = score;
+    }
+  } else {
+    board.push({name, score});
+  }
+
+  // Sort descending and trim
+  board.sort((a,b) => b.score - a.score);
+  if (board.length > MAX_LEADERBOARD_ENTRIES) board.length = MAX_LEADERBOARD_ENTRIES;
+
+  saveLeaderboard(board);
+}
+
+function drawLeaderboard() {
+  const board = loadLeaderboard();
+  ctx.fillStyle = '#222a';
+  ctx.fillRect(canvas.width - 220, 10, 210, 160);
+  ctx.fillStyle = 'white';
+  ctx.font = '18px sans-serif';
+  ctx.fillText('Leaderboard', canvas.width - 160, 35);
+  ctx.font = '14px monospace';
+  for (let i = 0; i < board.length; i++) {
+    const entry = board[i];
+    ctx.fillText(`${i+1}. ${entry.name.padEnd(12)}  ${entry.score}`, canvas.width - 210, 60 + i * 24);
+  }
+}
+
+/* --- Particle system for stomp effect --- */
+function createParticles(x, y) {
+  for (let i = 0; i < 12; i++) {
+    particles.push({
+      x: x + Math.random() * 20,
+      y: y + Math.random() * 10,
+      vx: (Math.random() - 0.5) * 4,
+      vy: Math.random() * -3 - 1,
+      alpha: 1,
+      size: 3 + Math.random() * 3
+    });
+  }
+}
+
+function updateParticles() {
+  particles.forEach(p => {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.15;
+    p.alpha -= 0.03;
+  });
+  particles = particles.filter(p => p.alpha > 0);
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    ctx.fillStyle = `rgba(200, 200, 200, ${p.alpha})`;
+    ctx.beginPath();
+    ctx.arc(p.x - cameraX, p.y, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  });
+}
+
+function calculateMaxJumpDistance() {
+  const timeUp = -JUMP_POWER / GRAVITY;
+  const totalAirTime = timeUp * 2;
+  return PLAYER_SPEED * totalAirTime * 0.9;
+}
+
+function createPlatform(x, width = 150, y = null) {
+  if (y === null) {
+    y = canvas.height - 60 - (Math.random() * 90);
+    y = Math.min(Math.max(y, MIN_PLATFORM_Y), MAX_PLATFORM_Y);
+  }
+  platforms.push({ x, y, width, height: 20 });
+
+  if (x === 0) return; // no spawns on start platform
+
+  if (Math.random() < COIN_SPAWN_RATE) {
+    const count = 1 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < count; i++) {
+      coins.push({
+        x: x + 20 + i * 28,
+        y: y - 18,
+        collected: false
+      });
+    }
+  }
+
+  if (Math.random() < EXTRA_LIFE_SPAWN_RATE) {
+    extraLives.push({
+      x: x + width / 2,
+      y: y - 20,
+      collected: false
+    });
+  }
+
+  if (Math.random() < ENEMY_SPAWN_RATE) {
+    enemies.push({
+      x: x + 20,
+      y: y - 30,
+      width: 30,
+      height: 30,
+      vx: Math.random() < 0.5 ? -1 : 1,
+      leftBound: x,
+      rightBound: x + width - 30,
+      dead: false
+    });
+  }
+}
+
+function generatePlatformsIfNeeded() {
+  if (platforms.length === 0) {
+    createPlatform(0, 500, canvas.height - 60 - 20);
+  }
+
+  const maxGap = calculateMaxJumpDistance();
+  let last = platforms[platforms.length - 1];
+
+  while (last.x + last.width < cameraX + canvas.width + 300) {
+    const minGap = 60;
+    const gap = minGap + Math.random() * (maxGap - minGap);
+    const width = 120 + Math.random() * 80;
+
+    const maxJumpHeight = (JUMP_POWER * JUMP_POWER) / (2 * GRAVITY);
+    let heightChange = (Math.random() - 0.5) * maxJumpHeight * 1.2;
+    let newY = last.y + heightChange;
+    newY = Math.min(Math.max(newY, MIN_PLATFORM_Y), MAX_PLATFORM_Y);
+
+    createPlatform(last.x + last.width + gap, width, newY);
+    last = platforms[platforms.length - 1];
+  }
+
+  const leftLimit = cameraX - 400;
+  platforms = platforms.filter(p => p.x + p.width > leftLimit);
+  coins = coins.filter(c => c.x + 12 > leftLimit && !c.collected);
+  extraLives = extraLives.filter(h => h.x + 12 > leftLimit && !h.collected);
+  enemies = enemies.filter(e => e.x + e.width > leftLimit && !e.dead);
+}
+
+function updateHighestAndSave() {
+  if (player.coins > highestCoins) {
+    highestCoins = player.coins;
+    localStorage.setItem('highestCoins', highestCoins);
+    updateLeaderboard(playerName, highestCoins);
+  }
+}
+
+function resetRun() {
+  updateHighestAndSave();
+  platforms = [];
+  coins = [];
+  extraLives = [];
+  enemies = [];
+  cameraX = 0;
+  player.coins = 0;
+  player.lives = 1;
+  player.vy = 0;
+  createPlatform(0, 500, canvas.height - 60 - 20);
+  for (let i = 1; i < 6; i++) {
+    createPlatform(i * PLATFORM_SPACING_BASE);
+  }
+  player.x = 120;
+  player.y = platforms[0].y - player.height;
+  player.onGround = true;
+  player.deadTimer = 0;
+}
+
+function respawnOnSafePlatform() {
+  let candidate = platforms.slice().reverse().find(p => p.x < player.x + 1);
+  if (!candidate) candidate = platforms[0];
+  player.x = candidate.x + 20;
+  player.y = candidate.y - player.height;
+  player.vy = 0;
+  player.onGround = true;
+  player.deadTimer = 0;
+}
+
+function update() {
+  if (player.deadTimer > 0) {
+    player.deadTimer--;
+    if (player.deadTimer === 0) {
+      if (player.lives <= 0) {
+        resetRun();
+      } else {
+        respawnOnSafePlatform();
+      }
+    }
+    updateParticles();
+    return;
+  }
+
+  const prevBottom = player.y + player.height;
+
+  let moving = false;
+  if (keys['ArrowRight'] || keys['KeyD']) {
+    player.x += PLAYER_SPEED;
+    player.facingRight = true;
+    moving = true;
+  }
+  if (keys['ArrowLeft'] || keys['KeyA']) {
+    player.x -= PLAYER_SPEED;
+    player.facingRight = false;
+    moving = true;
+  }
+
+  if (moving) {
+    player.frameTick++;
+    if (player.frameTick > 6) {
+      player.frame = (player.frame + 1) % 4;
+      player.frameTick = 0;
+    }
+  } else {
+    player.frame = 0;
+    player.frameTick = 0;
+  }
+
+  if ((keys['Space'] || keys['ArrowUp'] || keys['KeyW']) && player.onGround) {
+    player.vy = JUMP_POWER;
+    player.onGround = false;
+  }
+
+  player.vy += GRAVITY;
+  player.y += player.vy;
+
+  player.onGround = false;
+  for (const plat of platforms) {
+    const horizontalOverlap = player.x + player.width > plat.x && player.x < plat.x + plat.width;
+    const currentBottom = player.y + player.height;
+    if (horizontalOverlap && prevBottom <= plat.y && currentBottom >= plat.y) {
+      player.y = plat.y - player.height;
+      player.vy = 0;
+      player.onGround = true;
+    }
+  }
+
+  for (const c of coins) {
+    if (!c.collected &&
+        player.x < c.x + 12 &&
+        player.x + player.width > c.x &&
+        player.y < c.y + 12 &&
+        player.y + player.height > c.y) {
+      c.collected = true;
+      player.coins++;
+    }
+  }
+
+  for (const h of extraLives) {
+    if (!h.collected &&
+        player.x < h.x + 12 &&
+        player.x + player.width > h.x &&
+        player.y < h.y + 12 &&
+        player.y + player.height > h.y) {
+      h.collected = true;
+      player.lives++;
+    }
+  }
+
+  for (const e of enemies) {
+    if (e.dead) continue;
+    e.x += e.vx;
+    if (e.x < e.leftBound) { e.x = e.leftBound; e.vx *= -1; }
+    if (e.x > e.rightBound) { e.x = e.rightBound; e.vx *= -1; }
+
+    const horizontalOverlap = player.x + player.width > e.x && player.x < e.x + e.width;
+    const currentBottom = player.y + player.height;
+    if (horizontalOverlap && prevBottom <= e.y && currentBottom >= e.y && player.vy > 0) {
+      e.dead = true;
+      player.vy = JUMP_POWER * 0.65;
+      player.onGround = false;
+      createParticles(e.x, e.y + e.height);
+    } else if (!e.dead && horizontalOverlap &&
+               player.y < e.y + e.height &&
+               player.y + player.height > e.y) {
+      player.lives--;
+      player.deadTimer = 60;
+    }
+  }
+  
+  if (player.y > canvas.height + 100) {
+    player.lives--;
+    player.deadTimer = 60;
+  }
+
+  cameraX = player.x - 200;
+  if (cameraX < 0) cameraX = 0;
+
+  generatePlatformsIfNeeded();
+  updateParticles();
+}
+
+function drawPlayer(px, py) {
+  ctx.save();
+  ctx.translate(px, py);
+
+  if (!player.facingRight) {
+    ctx.translate(player.width, 0);
+    ctx.scale(-1, 1);
+  }
+
+  ctx.fillStyle = '#ffcc99';
+  ctx.fillRect(8, 0, 14, 14);
+
+  ctx.fillStyle = '#c0392b';
+  ctx.fillRect(5, 14, 20, 26);
+
+  ctx.fillStyle = '#8b2a1a';
+  const legOffset = (player.frame % 2 === 0) ? 0 : 4;
+  ctx.fillRect(6 + legOffset, 40, 7, 8);
+  ctx.fillRect(17 - legOffset, 40, 7, 8);
+
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#87ceeb';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillStyle = '#654321';
+  platforms.forEach(p => ctx.fillRect(p.x - cameraX, p.y, p.width, p.height));
+
+  coins.forEach(c => {
+    if (!c.collected) {
+      ctx.fillStyle = 'gold';
+      ctx.beginPath();
+      ctx.arc(c.x - cameraX + 6, c.y + 6, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#b8860b';
+      ctx.stroke();
+    }
+  });
+
+  extraLives.forEach(h => {
+    if (!h.collected) {
+      const hx = h.x - cameraX;
+      const hy = h.y;
+      ctx.save();
+      ctx.translate(hx, hy);
+      ctx.beginPath();
+      ctx.moveTo(0, 6);
+      ctx.arc(-4, 6, 4, Math.PI, 0);
+      ctx.arc(4, 6, 4, Math.PI, 0);
+      ctx.lineTo(0, 16);
+      ctx.closePath();
+      ctx.fillStyle = 'red';
+      ctx.fill();
+      ctx.restore();
+    }
+  });
+
+  enemies.forEach(e => {
+    if (e.dead) return;
+    ctx.fillStyle = 'green';
+    ctx.fillRect(e.x - cameraX, e.y, e.width, e.height);
+    ctx.fillStyle = 'white';
+    ctx.fillRect(e.x - cameraX + 6, e.y + 6, 5, 5);
+    ctx.fillRect(e.x - cameraX + 18, e.y + 6, 5, 5);
+    ctx.fillStyle = 'black';
+    ctx.fillRect(e.x - cameraX + 8, e.y + 8, 2, 2);
+    ctx.fillRect(e.x - cameraX + 20, e.y + 8, 2, 2);
+  });
+
+  drawPlayer(player.x - cameraX, player.y);
+  drawParticles();
+
+  ctx.fillStyle = '#000';
+  ctx.font = '16px sans-serif';
+
+  if (player.deadTimer > 0) {
+    ctx.fillStyle = 'red';
+    ctx.font = '40px sans-serif';
+    ctx.fillText('YOU DIED', canvas.width / 2 - 100, canvas.height / 2);
+    ctx.font = '16px sans-serif';
+    ctx.fillStyle = '#000';
+  }
+
+  ctx.fillText(`Lives: ${player.lives}`, 12, 20);
+  ctx.fillText(`Coins: ${player.coins}`, 12, 42);
+  ctx.fillText(`High Score: ${highestCoins}`, 12, 64);
+
+  drawLeaderboard();
+}
+
+/* --- Main loop --- */
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+/* --- Name prompt logic --- */
+const namePrompt = document.getElementById('namePrompt');
+const playerNameInput = document.getElementById('playerNameInput');
+const startBtn = document.getElementById('startBtn');
+
+function showNamePrompt() {
+  namePrompt.style.display = 'block';
+  playerNameInput.focus();
+}
+
+function startGameWithName(name) {
+  playerName = name.trim().substring(0, 12) || 'Player';
+  localStorage.setItem('playerName', playerName);
+
+  // Load their highest score from leaderboard
+  const board = loadLeaderboard();
+  const entry = board.find(e => e.name === playerName);
+  highestCoins = entry ? entry.score : 0;
+
+  resetRun();
+  loop();
+  namePrompt.style.display = 'none';
+}
+
+startBtn.onclick = () => {
+  const val = playerNameInput.value;
+  if (val.trim().length === 0) {
+    alert('Please enter your name!');
+    playerNameInput.focus();
+    return;
+  }
+  startGameWithName(val);
+};
+
+window.onload = () => {
+  const storedName = localStorage.getItem('playerName');
+  if (storedName) {
+    startGameWithName(storedName);
+  } else {
+    showNamePrompt();
+  }
+};
+</script>
+</body>
+</html>
